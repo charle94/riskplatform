@@ -39,8 +39,12 @@ python3 - <<'PY_CHECK'
 try:
     import fastapi  # noqa: F401
     import uvicorn  # noqa: F401
+    import polars   # noqa: F401
 except ModuleNotFoundError as exc:
-    raise SystemExit(f"错误：Python 依赖缺失：{exc.name}。请先执行：python3 -m pip install fastapi uvicorn")
+    raise SystemExit(
+        f"错误：Python 依赖缺失：{exc.name}。"
+        "请先执行：python3 -m pip install -r requirements.txt"
+    )
 PY_CHECK
 
 LAN_IP="$(get_lan_ip)"
@@ -57,12 +61,19 @@ cleanup() {
   if [ -n "${BACKEND_PID:-}" ]; then
     kill "$BACKEND_PID" 2>/dev/null || true
   fi
+  if [ -n "${WORKER_PID:-}" ]; then
+    kill "$WORKER_PID" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT INT TERM
 
 echo "启动后端：http://$LAN_IP:$BACKEND_PORT"
 python3 server/main.py &
 BACKEND_PID=$!
+
+echo "启动特征分析 Worker..."
+python3 server/analysis_worker.py &
+WORKER_PID=$!
 
 echo "启动前端：http://$LAN_IP:$FRONTEND_PORT"
 npm run dev -- --host "$HOST" --port "$FRONTEND_PORT" &
@@ -80,4 +91,4 @@ echo "  局域网：http://$LAN_IP:$BACKEND_PORT"
 echo "========================================"
 echo "按 Ctrl+C 停止所有服务。"
 
-wait "$FRONTEND_PID" "$BACKEND_PID"
+wait "$FRONTEND_PID" "$BACKEND_PID" "$WORKER_PID"

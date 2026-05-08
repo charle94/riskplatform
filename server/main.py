@@ -291,6 +291,41 @@ def init_db() -> None:
             payload TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS analysis_jobs (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            triggered_by TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL DEFAULT '',
+            total_features INTEGER NOT NULL DEFAULT 0,
+            success_features INTEGER NOT NULL DEFAULT 0,
+            error_msg TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS feature_stats_cache (
+            feature_id TEXT PRIMARY KEY,
+            feature_name TEXT NOT NULL DEFAULT '',
+            iv REAL NOT NULL DEFAULT 0,
+            ks REAL NOT NULL DEFAULT 0,
+            psi REAL NOT NULL DEFAULT 0,
+            auc REAL NOT NULL DEFAULT 0,
+            crossing INTEGER NOT NULL DEFAULT 0,
+            missing_rate REAL NOT NULL DEFAULT 0,
+            mean REAL NOT NULL DEFAULT 0,
+            std REAL NOT NULL DEFAULT 0,
+            min_val REAL NOT NULL DEFAULT 0,
+            max_val REAL NOT NULL DEFAULT 0,
+            p25 REAL NOT NULL DEFAULT 0,
+            p75 REAL NOT NULL DEFAULT 0,
+            skewness REAL NOT NULL DEFAULT 0,
+            kurtosis REAL NOT NULL DEFAULT 0,
+            distribution_json TEXT NOT NULL DEFAULT '[]',
+            psi_trend_json TEXT NOT NULL DEFAULT '[]',
+            stability_status TEXT NOT NULL DEFAULT '稳定',
+            job_id TEXT NOT NULL DEFAULT '',
+            computed_at TEXT NOT NULL DEFAULT ''
+        );
         """
     )
 
@@ -544,6 +579,146 @@ def log_activity(
         """,
         (log_id, event_type, text, actor, now_clock(), module, detail),
     )
+
+
+def _trigger_analysis_job_db(conn: sqlite3.Connection, triggered_by: str = "manual") -> str:
+    """Insert a pending analysis job record and return its ID."""
+    existing_ids = [r["id"] for r in conn.execute("SELECT id FROM analysis_jobs").fetchall()]
+    job_id = _next_numeric_id(existing_ids, "ANLYS", width=5)
+    conn.execute(
+        """
+        INSERT INTO analysis_jobs (id, status, triggered_by, started_at, ended_at,
+                                   total_features, success_features, error_msg)
+        VALUES (?, 'pending', ?, ?, '', 0, 0, '')
+        """,
+        (job_id, triggered_by, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    return job_id
+
+
+def build_analysis_from_cache(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Build the analysis overview response from pre-computed feature_stats_cache."""
+    rows = conn.execute(
+        "SELECT * FROM feature_stats_cache ORDER BY iv DESC"
+    ).fetchall()
+
+    empty_stability_cards = [
+        {"label": "稳定特征（PSI<0.1）", "value": "0", "pct": "0.0%", "color": "emerald"},
+        {"label": "轻微波动（PSI 0.1-0.2）", "value": "0", "pct": "0.0%", "color": "amber"},
+        {"label": "显著漂移（PSI>0.2）", "value": "0", "pct": "0.0%", "color": "red"},
+    ]
+
+    if not rows:
+        return {
+            "empty": True,
+            "message": "分析任务尚未运行，请点击「触发分析」按钮启动后台分析任务",
+            "featureStats": [],
+            "ivData": [],
+            "distributionData": [],
+            "psiTrendData": [],
+            "psiTrendSeries": [],
+            "stabilityCards": empty_stability_cards,
+            "driftAlerts": [],
+            "lastComputedAt": "",
+        }
+
+    # featureStats (top 10 by IV)
+    feature_stats: List[Dict[str, Any]] = []
+    for r in rows[:10]:
+        psi = float(r["psi"])
+        stats_status = "正常" if psi < 0.1 else ("右偏" if psi < 0.2 else "极右偏")
+        feature_stats.append({
+            "name": r["feature_name"],
+            "missing": f"{float(r['missing_rate']) * 100:.1f}%",
+            "min": round(float(r["min_val"]), 4),
+            "max": round(float(r["max_val"]), 4),
+            "mean": round(float(r["mean"]), 4),
+            "std": round(float(r["std"]), 4),
+            "p25": round(float(r["p25"]), 4),
+            "p75": round(float(r["p75"]), 4),
+            "skewness": round(float(r["skewness"]), 3),
+            "kurtosis": round(float(r["kurtosis"]), 3),
+            "status": stats_status,
+        })
+
+    # ivData (top 20 by IV)
+    iv_data: List[Dict[str, Any]] = []
+    for r in rows[:20]:
+        iv_data.append({
+            "name": r["feature_name"],
+            "iv": round(float(r["iv"]), 3),
+            "ks": round(float(r["ks"]), 3),
+            "psi": round(float(r["psi"]), 3),
+            "auc": round(float(r["auc"]), 3),
+            "crossing": bool(r["crossing"]),
+        })
+
+    # distributionData – prefer the canonical demo feature; fall back to first non-empty
+    # "夜间交易金额占比" is the feature shown in the EDA distribution chart by design.
+    dist_data: List[Dict[str, Any]] = []
+    target_row = next(
+        (r for r in rows if r["feature_name"] == "夜间交易金额占比"),
+        rows[0],
+    )
+    try:
+        dist_data = json.loads(target_row["distribution_json"]) or []
+    except Exception:
+        dist_data = []
+
+    # psiTrendData / psiTrendSeries – top 3 features by PSI
+    window_count = 6
+    psi_candidates = sorted(rows, key=lambda x: float(x["psi"]), reverse=True)[:3]
+    psi_trend_data: List[Dict[str, Any]] = [{"month": f"窗口{i}"} for i in range(1, window_count + 1)]
+    psi_trend_series: List[Dict[str, str]] = []
+    for index, r in enumerate(psi_candidates, start=1):
+        key = f"F{index}"
+        try:
+            trend: List[float] = json.loads(r["psi_trend_json"]) or []
+        except Exception:
+            trend = []
+        while len(trend) < window_count:
+            trend.append(0.0)
+        for i, row_d in enumerate(psi_trend_data):
+            row_d[key] = round(float(trend[i]), 3)
+        last_psi = trend[-1] if trend else 0.0
+        psi_trend_series.append({
+            "key": key,
+            "name": r["feature_name"],
+            "status": "稳定" if float(last_psi) < 0.1 else ("波动" if float(last_psi) < 0.2 else "漂移"),
+        })
+
+    # stabilityCards
+    stable = sum(1 for r in rows if float(r["psi"]) < 0.1)
+    mild = sum(1 for r in rows if 0.1 <= float(r["psi"]) <= 0.2)
+    drift = sum(1 for r in rows if float(r["psi"]) > 0.2)
+    total_feats = max(1, len(rows))
+    stability_cards = [
+        {"label": "稳定特征（PSI<0.1）", "value": str(stable), "pct": f"{stable / total_feats * 100:.1f}%", "color": "emerald"},
+        {"label": "轻微波动（PSI 0.1-0.2）", "value": str(mild), "pct": f"{mild / total_feats * 100:.1f}%", "color": "amber"},
+        {"label": "显著漂移（PSI>0.2）", "value": str(drift), "pct": f"{drift / total_feats * 100:.1f}%", "color": "red"},
+    ]
+
+    # driftAlerts – top 3 most unstable
+    drift_alerts = [
+        {"name": r["feature_name"], "psi": round(float(r["psi"]), 3), "reason": "分布显著漂移"}
+        for r in sorted(rows, key=lambda x: float(x["psi"]), reverse=True)[:3]
+    ]
+
+    # last computed time
+    all_times = [r["computed_at"] for r in rows if r["computed_at"]]
+    last_computed_at = max(all_times) if all_times else ""
+
+    return {
+        "empty": False,
+        "featureStats": feature_stats,
+        "ivData": iv_data,
+        "distributionData": dist_data,
+        "psiTrendData": psi_trend_data,
+        "psiTrendSeries": psi_trend_series,
+        "stabilityCards": stability_cards,
+        "driftAlerts": drift_alerts,
+        "lastComputedAt": last_computed_at,
+    }
 
 
 def snapshot_feature_version(
@@ -1518,9 +1693,11 @@ def build_monitoring(conn: sqlite3.Connection) -> Dict[str, Any]:
         {"time": "09:50", "rate": 97.82},
     ]
 
-    eval_data = evaluate_features(conn)
-    top = eval_data["ivData"][:3]
-    iv_decay = []
+    eval_data_top = conn.execute(
+        "SELECT feature_name, iv FROM feature_stats_cache ORDER BY iv DESC LIMIT 3"
+    ).fetchall()
+    top = [{"name": r["feature_name"], "iv": float(r["iv"])} for r in eval_data_top]
+    iv_decay: List[Dict[str, Any]] = []
     months = ["10月", "11月", "12月", "1月", "2月", "3月"]
     for i, m in enumerate(months):
         item: Dict[str, Any] = {"month": m}
@@ -1540,7 +1717,9 @@ def build_monitoring(conn: sqlite3.Connection) -> Dict[str, Any]:
 
 def build_dashboard(conn: sqlite3.Connection) -> Dict[str, Any]:
     features = load_features(conn)
-    analysis = evaluate_features(conn)
+    cache_rows = conn.execute(
+        "SELECT feature_name, iv, ks, psi FROM feature_stats_cache ORDER BY iv DESC"
+    ).fetchall()
     alerts = [dict(r) for r in conn.execute("SELECT * FROM alerts").fetchall()]
     rules = [dict(r) for r in conn.execute("SELECT * FROM rules").fetchall()]
 
@@ -1570,8 +1749,8 @@ def build_dashboard(conn: sqlite3.Connection) -> Dict[str, Any]:
         "强 (0.3-0.5)": 0,
         "疑似穿越 (>0.5)": 0,
     }
-    for f in analysis["ivData"]:
-        iv = float(f["iv"])
+    for r in cache_rows:
+        iv = float(r["iv"])
         if iv < 0.02:
             iv_buckets["无效 (<0.02)"] += 1
         elif iv < 0.1:
@@ -1592,18 +1771,19 @@ def build_dashboard(conn: sqlite3.Connection) -> Dict[str, Any]:
     ]
 
     top_features = []
-    for item in analysis["ivData"][:5]:
+    for r in cache_rows[:5]:
         top_features.append({
-            "name": item["name"],
-            "iv": item["iv"],
-            "ks": item["ks"],
-            "psi": item["psi"],
-            "status": "波动" if float(item["psi"]) > 0.1 else "稳定",
+            "name": r["feature_name"],
+            "iv": round(float(r["iv"]), 3),
+            "ks": round(float(r["ks"]), 3),
+            "psi": round(float(r["psi"]), 3),
+            "status": "波动" if float(r["psi"]) > 0.1 else "稳定",
         })
 
+    cache_count = len(cache_rows)
     module_cards = {
         "featureDev": f"{total} 个特征",
-        "featureAnalysis": f"{len(analysis['ivData'])} 个已评估",
+        "featureAnalysis": f"{cache_count} 个已评估",
         "featureLibrary": f"{len({f['scene'] for f in features})} 个业务场景",
         "monitoring": f"{len([a for a in alerts if a['status'] in {'未处理', '处理中'}])} 个活跃告警",
         "ruleMining": f"{len([r for r in rules if r['status'] in {'上线', '测试中'}])} 条活跃规则",
@@ -2453,9 +2633,41 @@ def get_stats():
 @app.get("/api/analysis/overview")
 def analysis_overview():
     conn = get_conn()
-    data = evaluate_features(conn)
+    data = build_analysis_from_cache(conn)
     conn.close()
     return data
+
+
+@app.post("/api/analysis/trigger")
+def trigger_analysis(payload: Optional[Dict[str, Any]] = None):
+    triggered_by = str((payload or {}).get("triggered_by") or "manual")
+    conn = get_conn()
+    job_id = _trigger_analysis_job_db(conn, triggered_by)
+    conn.commit()
+    log_activity(conn, "analysis-trigger", f"触发后台分析任务 job={job_id}", "系统", "特征分析", triggered_by)
+    conn.commit()
+    conn.close()
+    return {"jobId": job_id, "message": "后台分析任务已提交，请稍后刷新页面查看结果"}
+
+
+@app.get("/api/analysis/jobs")
+def list_analysis_jobs(limit: int = Query(default=20, ge=1, le=100)):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM analysis_jobs ORDER BY started_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/analysis/jobs/{job_id}")
+def get_analysis_job(job_id: str):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Analysis job not found")
+    return dict(row)
 
 
 @app.get("/api/monitoring/overview")
@@ -2748,8 +2960,19 @@ def on_startup() -> None:
     has_activity = conn.execute("SELECT COUNT(1) AS c FROM activity_logs").fetchone()["c"]
     if has_activity == 0:
         log_activity(conn, "bootstrap", "系统初始化完成", "系统", "平台概览", "startup")
+
+    # Auto-trigger an analysis job if the stats cache is empty
+    cache_count = conn.execute("SELECT COUNT(1) AS c FROM feature_stats_cache").fetchone()["c"]
+    if cache_count == 0:
+        pending_count = conn.execute(
+            "SELECT COUNT(1) AS c FROM analysis_jobs WHERE status IN ('pending', 'running')"
+        ).fetchone()["c"]
+        if pending_count == 0:
+            _trigger_analysis_job_db(conn, "startup")
+
     conn.commit()
     conn.close()
+
 
 
 if __name__ == "__main__":
