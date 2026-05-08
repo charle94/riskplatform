@@ -183,6 +183,9 @@ export type Stats = {
 };
 
 export type AnalysisOverview = {
+  empty?: boolean;
+  message?: string;
+  lastComputedAt?: string;
   featureStats: Array<{
     name: string;
     missing: string;
@@ -209,6 +212,17 @@ export type AnalysisOverview = {
   psiTrendSeries: Array<{ key: string; name: string; status: string }>;
   stabilityCards: Array<{ label: string; value: string; pct: string; color: string }>;
   driftAlerts: Array<{ name: string; psi: number; reason: string }>;
+};
+
+export type AnalysisJob = {
+  id: string;
+  status: string;
+  triggered_by: string;
+  started_at: string;
+  ended_at: string;
+  total_features: number;
+  success_features: number;
+  error_msg: string;
 };
 
 export type MonitoringOverview = {
@@ -383,6 +397,14 @@ export const statsApi = {
 
 export const analysisApi = {
   overview: () => request<AnalysisOverview>("/api/analysis/overview"),
+  trigger: (triggeredBy?: string) =>
+    request<{ jobId: string; message: string }>("/api/analysis/trigger", {
+      method: "POST",
+      body: JSON.stringify({ triggered_by: triggeredBy || "manual" }),
+    }),
+  jobs: (limit?: number) =>
+    request<AnalysisJob[]>(`/api/analysis/jobs${limit ? `?limit=${limit}` : ""}`),
+  getJob: (jobId: string) => request<AnalysisJob>(`/api/analysis/jobs/${jobId}`),
 };
 
 export const monitoringApi = {

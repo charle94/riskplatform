@@ -1,12 +1,14 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   LineChart, Line, ReferenceLine,
 } from "recharts";
 import {
-  AlertTriangle, CheckCircle2, Info, TrendingDown, Search, Filter, Download,
+  AlertTriangle, CheckCircle2, Info, TrendingDown, Search, Download,
+  RefreshCw, Clock, Loader2,
 } from "lucide-react";
 import { analysisApi } from "../../../api";
+import type { AnalysisJob } from "../../../api";
 
 const tabs = ["探索性数据分析", "特征效果评估", "稳定性监控"];
 const psiTrendColors = ["#10b981", "#f59e0b", "#ef4444", "#3b82f6"];
@@ -34,10 +36,17 @@ export function FeatureAnalysis() {
   const [psiTrendSeriesState, setPsiTrendSeriesState] = useState<Array<{ key: string; name: string; status: string }>>([]);
   const [stabilityCardsState, setStabilityCardsState] = useState<Array<{ label: string; value: string; pct: string; color: string }>>([]);
   const [driftAlertsState, setDriftAlertsState] = useState<Array<{ name: string; psi: number; reason: string }>>([]);
+  const [isEmpty, setIsEmpty] = useState(false);
+  const [lastComputedAt, setLastComputedAt] = useState("");
+  const [currentJob, setCurrentJob] = useState<AnalysisJob | null>(null);
+  const [triggering, setTriggering] = useState(false);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  useEffect(() => {
+  const loadOverview = () => {
     analysisApi.overview()
       .then((data) => {
+        setIsEmpty(!!data.empty);
+        setLastComputedAt(data.lastComputedAt || "");
         setFeatureStatsState(data.featureStats);
         setIvDataState(data.ivData);
         setDistributionDataState(data.distributionData);
@@ -47,7 +56,60 @@ export function FeatureAnalysis() {
         setDriftAlertsState(data.driftAlerts);
       })
       .catch(() => {});
-  }, []);
+  };
+
+  const stopPolling = () => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  };
+
+  const startPolling = (jobId: string) => {
+    stopPolling();
+    pollTimerRef.current = setInterval(() => {
+      analysisApi.getJob(jobId)
+        .then((job) => {
+          setCurrentJob(job);
+          if (job.status === "completed" || job.status === "failed") {
+            stopPolling();
+            setTriggering(false);
+            if (job.status === "completed") {
+              loadOverview();
+            }
+          }
+        })
+        .catch(() => {});
+    }, 3000);
+  };
+
+  const handleTrigger = () => {
+    setTriggering(true);
+    analysisApi.trigger("manual")
+      .then((res) => {
+        startPolling(res.jobId);
+      })
+      .catch(() => {
+        setTriggering(false);
+      });
+  };
+
+  useEffect(() => {
+    loadOverview();
+    // Restore poll for any already-running job on page load
+    analysisApi.jobs(1)
+      .then((jobs) => {
+        if (jobs.length > 0 && (jobs[0].status === "pending" || jobs[0].status === "running")) {
+          setCurrentJob(jobs[0]);
+          setTriggering(true);
+          startPolling(jobs[0].id);
+        }
+      })
+      .catch(() => {});
+    return () => stopPolling();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const isJobRunning = triggering || currentJob?.status === "pending" || currentJob?.status === "running";
 
   const crossingFeatures = ivDataState.filter((f) => f.crossing);
   const filteredFeatures = ivDataState.filter((f) => f.name.includes(search));
@@ -59,12 +121,72 @@ export function FeatureAnalysis() {
           <h1 className="text-slate-900 font-semibold text-xl">特征分析与评估</h1>
           <p className="text-slate-500 text-sm mt-0.5">特征质检中心 · 科学评估有效性、稳定性与安全性</p>
         </div>
-        <button className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-200 transition-colors">
-          <Download size={14} /> 导出报告
-        </button>
+        <div className="flex items-center gap-3">
+          {lastComputedAt && (
+            <span className="flex items-center gap-1.5 text-xs text-slate-400">
+              <Clock size={12} />
+              上次计算：{lastComputedAt}
+            </span>
+          )}
+          <button
+            onClick={handleTrigger}
+            disabled={isJobRunning}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isJobRunning ? (
+              <><Loader2 size={14} className="animate-spin" /> 分析中…</>
+            ) : (
+              <><RefreshCw size={14} /> 触发分析</>
+            )}
+          </button>
+          <button className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-200 transition-colors">
+            <Download size={14} /> 导出报告
+          </button>
+        </div>
       </div>
 
-      {/* Alerts */}
+      {/* Job running banner */}
+      {isJobRunning && currentJob && (
+        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 flex items-center gap-3">
+          <Loader2 size={16} className="text-blue-600 animate-spin flex-shrink-0" />
+          <div>
+            <span className="text-blue-800 font-semibold text-sm">后台分析任务运行中</span>
+            <p className="text-blue-600 text-xs mt-0.5">
+              任务 {currentJob.id} · 状态：{currentJob.status === "pending" ? "等待中" : "运行中"} · 完成后页面将自动刷新
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Failed job banner */}
+      {currentJob?.status === "failed" && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-center gap-3">
+          <AlertTriangle size={16} className="text-red-600 flex-shrink-0" />
+          <div>
+            <span className="text-red-800 font-semibold text-sm">分析任务失败</span>
+            {currentJob.error_msg && (
+              <p className="text-red-600 text-xs mt-0.5">{currentJob.error_msg}</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Empty cache state */}
+      {isEmpty && !isJobRunning && (
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-8 text-center">
+          <RefreshCw size={32} className="text-slate-300 mx-auto mb-3" />
+          <p className="text-slate-600 font-medium text-sm">统计缓存为空</p>
+          <p className="text-slate-400 text-xs mt-1 mb-4">点击「触发分析」按钮，后台将启动 Polars 分析任务并将结果写入缓存</p>
+          <button
+            onClick={handleTrigger}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors"
+          >
+            <RefreshCw size={14} /> 触发分析
+          </button>
+        </div>
+      )}
+
+      {/* Crossing alerts */}
       {crossingFeatures.length > 0 && (
         <div className="bg-red-50 border border-red-200 rounded-xl p-4">
           <div className="flex items-center gap-2 mb-2">
