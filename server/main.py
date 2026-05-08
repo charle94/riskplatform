@@ -653,7 +653,8 @@ def build_analysis_from_cache(conn: sqlite3.Connection) -> Dict[str, Any]:
             "crossing": bool(r["crossing"]),
         })
 
-    # distributionData – prefer "夜间交易金额占比", fall back to first non-empty
+    # distributionData – prefer the canonical demo feature; fall back to first non-empty
+    # "夜间交易金额占比" is the feature shown in the EDA distribution chart by design.
     dist_data: List[Dict[str, Any]] = []
     target_row = next(
         (r for r in rows if r["feature_name"] == "夜间交易金额占比"),

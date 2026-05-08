@@ -475,14 +475,12 @@ class FeatureAnalysisWorker:
             snapshot_inserts: List[Tuple] = []
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # Pre-compute snapshot ID base to avoid repeated queries inside the loop
-            existing_snap_ids = [
-                r["id"] for r in conn.execute("SELECT id FROM feature_eval_snapshots WHERE id LIKE 'EV%'").fetchall()
-            ]
-            existing_snap_nums = [
-                int(sid[2:]) for sid in existing_snap_ids if sid[2:].isdigit()
-            ]
-            next_snap_num = (max(existing_snap_nums) + 1) if existing_snap_nums else 1
+            # Pre-compute snapshot ID base using MAX to avoid scanning all records
+            max_snap_row = conn.execute(
+                "SELECT MAX(CAST(SUBSTR(id, 3) AS INTEGER)) AS max_num "
+                "FROM feature_eval_snapshots WHERE id LIKE 'EV%'"
+            ).fetchone()
+            next_snap_num = (max_snap_row["max_num"] or 0) + 1
 
             for fr in feature_rows:
                 result = self.analyze_feature(
