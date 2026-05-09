@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   Database, Plus, RefreshCw, CheckCircle2, AlertCircle,
-  Zap, Eye, GitBranch, Search, Settings, Play, Pause, X, Trash2,
+  Zap, Eye, GitBranch, Search, Settings, Play, Pause, X, Trash2, Download,
 } from "lucide-react";
-import { datasourcesApi, tasksApi, featureDevApi } from "../../../api";
+import { datasourcesApi, tasksApi, featureDevApi, featuresApi, computeApi } from "../../../api";
 import type { DataSource, Task, Feature, FeatureSuggestion } from "../../../api";
 import { toast } from "sonner";
 
@@ -15,32 +15,96 @@ function DataSourceDialog({
   onSave: (data: Partial<DataSource>) => void;
   initial?: DataSource | null;
 }) {
-  const [form, setForm] = useState({ name: "", type: "MySQL", host: "", port: "", database: "", coverage: "0" });
+  const isFileType = (t: string) => t === "CSV" || t === "XLSX";
+
+  const [form, setForm] = useState({
+    name: "", type: "MySQL", host: "", port: "", database: "", coverage: "0",
+    file_path: "", pk_column: "", date_column: "", table_name: "",
+  });
+  const [featureColumns, setFeatureColumns] = useState<string[]>([]);
+  const [previewCols, setPreviewCols] = useState<string[]>([]);
+  const [previewRows, setPreviewRows] = useState<Record<string, unknown>[]>([]);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
 
   useEffect(() => {
-    if (initial) {
-      setForm({ name: initial.name, type: initial.type, host: initial.host || "", port: String(initial.port || ""), database: initial.database || "", coverage: String(initial.coverage) });
-    } else {
-      setForm({ name: "", type: "MySQL", host: "", port: "", database: "", coverage: "0" });
+    if (open) {
+      if (initial) {
+        let fc: string[] = [];
+        try { fc = JSON.parse(initial.feature_columns || "[]"); } catch { fc = []; }
+        setForm({
+          name: initial.name, type: initial.type, host: initial.host || "",
+          port: String(initial.port || ""), database: initial.database || "",
+          coverage: String(initial.coverage), file_path: initial.file_path || "",
+          pk_column: initial.pk_column || "", date_column: initial.date_column || "",
+          table_name: initial.table_name || "",
+        });
+        setFeatureColumns(fc);
+      } else {
+        setForm({ name: "", type: "MySQL", host: "", port: "", database: "", coverage: "0", file_path: "", pk_column: "", date_column: "", table_name: "" });
+        setFeatureColumns([]);
+      }
+      setPreviewCols([]);
+      setPreviewRows([]);
+      setShowPreview(false);
     }
   }, [initial, open]);
 
   if (!open) return null;
 
+  const handlePreviewFile = async () => {
+    if (!form.file_path.trim()) { toast.error("请填写文件路径"); return; }
+    setPreviewLoading(true);
+    try {
+      const result = await datasourcesApi.previewFile(
+        form.file_path.trim(),
+        form.type.toLowerCase() as "csv" | "xlsx",
+      );
+      setPreviewCols(result.columns);
+      setPreviewRows(result.rows);
+      setShowPreview(true);
+      toast.success(`读取成功，共 ${result.columns.length} 列`);
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : "文件读取失败");
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const toggleFeatureColumn = (col: string) => {
+    setFeatureColumns(prev => prev.includes(col) ? prev.filter(c => c !== col) : [...prev, col]);
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.name.trim()) { toast.error("请填写数据源名称"); return; }
-    onSave({ name: form.name.trim(), type: form.type, host: form.host, port: Number(form.port) || 0, database: form.database, coverage: Number(form.coverage) || 0 });
+    const payload: Partial<DataSource> = {
+      name: form.name.trim(), type: form.type, coverage: Number(form.coverage) || 0,
+      pk_column: form.pk_column, date_column: form.date_column,
+    };
+    if (isFileType(form.type)) {
+      if (!form.file_path.trim()) { toast.error("请填写文件路径"); return; }
+      payload.file_path = form.file_path.trim();
+      payload.feature_columns = JSON.stringify(featureColumns);
+    } else {
+      payload.host = form.host;
+      payload.port = Number(form.port) || 0;
+      payload.database = form.database;
+      payload.table_name = form.table_name;
+    }
+    onSave(payload);
   };
+
+  const nonKeyValueCols = previewCols.filter(c => c !== form.pk_column && c !== form.date_column);
 
   return (
     <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
           <h2 className="font-semibold text-slate-900">{initial ? "编辑数据源" : "接入新数据源"}</h2>
           <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400"><X size={16} /></button>
         </div>
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
+        <form onSubmit={handleSubmit} className="p-6 space-y-4 overflow-y-auto flex-1">
           <div className="grid grid-cols-2 gap-4">
             <div className="col-span-2">
               <label className="text-xs text-slate-500 font-medium block mb-1.5">数据源名称 <span className="text-red-500">*</span></label>
@@ -48,27 +112,107 @@ function DataSourceDialog({
             </div>
             <div>
               <label className="text-xs text-slate-500 font-medium block mb-1.5">类型</label>
-              <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={form.type} onChange={e => setForm(f => ({ ...f, type: e.target.value }))}>
-                {["MySQL", "PostgreSQL", "Hive", "HDFS", "Kafka", "API"].map(t => <option key={t}>{t}</option>)}
+              <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={form.type}
+                onChange={e => { setForm(f => ({ ...f, type: e.target.value })); setPreviewCols([]); setPreviewRows([]); setShowPreview(false); }}>
+                {["MySQL", "PostgreSQL", "Hive", "HDFS", "Kafka", "API", "CSV", "XLSX"].map(t => <option key={t}>{t}</option>)}
               </select>
             </div>
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">主机/端点</label>
-              <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="db.internal" value={form.host} onChange={e => setForm(f => ({ ...f, host: e.target.value }))} />
-            </div>
-            <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">端口</label>
-              <input type="number" className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="3306" value={form.port} onChange={e => setForm(f => ({ ...f, port: e.target.value }))} />
-            </div>
-            <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">数据库/Topic</label>
-              <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="database_name" value={form.database} onChange={e => setForm(f => ({ ...f, database: e.target.value }))} />
-            </div>
-            <div className="col-span-2">
               <label className="text-xs text-slate-500 font-medium block mb-1.5">覆盖率 (%)</label>
               <input type="number" min="0" max="100" className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" value={form.coverage} onChange={e => setForm(f => ({ ...f, coverage: e.target.value }))} />
             </div>
           </div>
+
+          {isFileType(form.type) ? (
+            <>
+              <div>
+                <label className="text-xs text-slate-500 font-medium block mb-1.5">文件路径 <span className="text-red-500">*</span></label>
+                <div className="flex gap-2">
+                  <input className="flex-1 px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400 font-mono" placeholder="/data/features.csv" value={form.file_path} onChange={e => setForm(f => ({ ...f, file_path: e.target.value }))} />
+                  <button type="button" onClick={() => void handlePreviewFile()} disabled={previewLoading || !form.file_path.trim()} className="px-3 py-2 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg text-xs font-medium hover:bg-blue-100 disabled:opacity-50 whitespace-nowrap">
+                    {previewLoading ? "读取中..." : "读取预览"}
+                  </button>
+                </div>
+              </div>
+              {showPreview && previewCols.length > 0 && (
+                <>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs text-slate-500 font-medium block mb-1.5">主键列 <span className="text-red-500">*</span></label>
+                      <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={form.pk_column} onChange={e => setForm(f => ({ ...f, pk_column: e.target.value }))}>
+                        <option value="">-- 选择主键列 --</option>
+                        {previewCols.map(c => <option key={c}>{c}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-500 font-medium block mb-1.5">日期列</label>
+                      <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={form.date_column} onChange={e => setForm(f => ({ ...f, date_column: e.target.value }))}>
+                        <option value="">-- 选择日期列 --</option>
+                        {previewCols.map(c => <option key={c}>{c}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                  {nonKeyValueCols.length > 0 && (
+                    <div>
+                      <label className="text-xs text-slate-500 font-medium block mb-1.5">入库特征列（多选）</label>
+                      <div className="border border-slate-200 rounded-lg p-3 max-h-36 overflow-y-auto grid grid-cols-3 gap-1.5">
+                        {nonKeyValueCols.map(c => (
+                          <label key={c} className="flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer hover:text-blue-700">
+                            <input type="checkbox" checked={featureColumns.includes(c)} onChange={() => toggleFeatureColumn(c)} className="rounded" />
+                            <span className="font-mono truncate">{c}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-1">已选 {featureColumns.length} / {nonKeyValueCols.length} 列</div>
+                    </div>
+                  )}
+                  {previewRows.length > 0 && (
+                    <div>
+                      <label className="text-xs text-slate-500 font-medium block mb-1.5">数据预览（前 {previewRows.length} 行）</label>
+                      <div className="border border-slate-200 rounded-lg overflow-x-auto">
+                        <table className="w-full text-[11px]">
+                          <thead><tr className="bg-slate-50">{previewCols.map(c => <th key={c} className="px-2 py-1.5 text-left text-slate-500 font-medium whitespace-nowrap">{c}</th>)}</tr></thead>
+                          <tbody>{previewRows.map((row, i) => (
+                            <tr key={i} className="border-t border-slate-100">
+                              {previewCols.map(c => <td key={c} className="px-2 py-1.5 text-slate-700 font-mono whitespace-nowrap">{String(row[c] ?? "")}</td>)}
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          ) : (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs text-slate-500 font-medium block mb-1.5">主机/端点</label>
+                <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="db.internal" value={form.host} onChange={e => setForm(f => ({ ...f, host: e.target.value }))} />
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 font-medium block mb-1.5">端口</label>
+                <input type="number" className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="3306" value={form.port} onChange={e => setForm(f => ({ ...f, port: e.target.value }))} />
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 font-medium block mb-1.5">数据库</label>
+                <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="database_name" value={form.database} onChange={e => setForm(f => ({ ...f, database: e.target.value }))} />
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 font-medium block mb-1.5">表名</label>
+                <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="table_name" value={form.table_name} onChange={e => setForm(f => ({ ...f, table_name: e.target.value }))} />
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 font-medium block mb-1.5">主键列</label>
+                <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="user_id" value={form.pk_column} onChange={e => setForm(f => ({ ...f, pk_column: e.target.value }))} />
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 font-medium block mb-1.5">日期列</label>
+                <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400" placeholder="event_date" value={form.date_column} onChange={e => setForm(f => ({ ...f, date_column: e.target.value }))} />
+              </div>
+            </div>
+          )}
+
           <div className="flex gap-3 pt-2">
             <button type="button" onClick={onClose} className="flex-1 px-4 py-2 border border-slate-200 text-slate-600 rounded-lg text-sm hover:bg-slate-50">取消</button>
             <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">{initial ? "保存修改" : "接入"}</button>
@@ -282,6 +426,21 @@ export function FeatureDevelopment() {
   const [workbenchSource, setWorkbenchSource] = useState("用户行为埋点");
   const [workbenchScene, setWorkbenchScene] = useState("贷前审批");
   const [workbenchDefinition, setWorkbenchDefinition] = useState("night_txn_ratio / (query_6m + 1)");
+  const [workbenchCategory, setWorkbenchCategory] = useState("行为特征");
+  const [workbenchDatasourceId, setWorkbenchDatasourceId] = useState("");
+
+  // Compute panel state
+  const [computePanelOpen, setComputePanelOpen] = useState(false);
+  const [computeEngine, setComputeEngine] = useState<"polars" | "hive">("polars");
+  const [computeCategory, setComputeCategory] = useState("全部");
+  const [computeFeatureIds, setComputeFeatureIds] = useState<string[]>([]);
+  const [allFeatures, setAllFeatures] = useState<Feature[]>([]);
+  const [computeSavePath, setComputeSavePath] = useState("");
+  const [computeHiveDb, setComputeHiveDb] = useState("");
+  const [computeHiveTable, setComputeHiveTable] = useState("");
+  const [computeRunning, setComputeRunning] = useState(false);
+  const [computeJobResult, setComputeJobResult] = useState<{ job_id: string; status: string; feature_count: number; duration_ms: number } | null>(null);
+  const [computeImporting, setComputeImporting] = useState(false);
 
   const loadDatasources = useCallback(async () => {
     setDsLoading(true);
@@ -302,6 +461,11 @@ export function FeatureDevelopment() {
   useEffect(() => {
     if (activeTab === 1) {
       featureDevApi.suggestions(3).then(res => setSuggestions(res.recommendations)).catch(() => setSuggestions([]));
+    }
+  }, [activeTab]);
+  useEffect(() => {
+    if (activeTab === 2) {
+      featuresApi.list().then(data => setAllFeatures(data)).catch(() => setAllFeatures([]));
     }
   }, [activeTab]);
 
@@ -349,6 +513,71 @@ export function FeatureDevelopment() {
     catch { toast.error("删除失败"); }
   };
 
+  const filteredComputeFeatures = computeCategory === "全部"
+    ? allFeatures
+    : allFeatures.filter(f => f.category === computeCategory);
+
+  const toggleComputeFeature = (id: string) => {
+    setComputeFeatureIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+
+  const handleSelectAllComputeFeatures = () => {
+    const ids = filteredComputeFeatures.map(f => f.id);
+    const allSelected = ids.every(id => computeFeatureIds.includes(id));
+    if (allSelected) {
+      setComputeFeatureIds(prev => prev.filter(id => !ids.includes(id)));
+    } else {
+      setComputeFeatureIds(prev => Array.from(new Set([...prev, ...ids])));
+    }
+  };
+
+  const handleComputeRun = async () => {
+    if (computeFeatureIds.length === 0 && computeCategory === "全部") {
+      toast.error("请至少选择一个特征，或指定特征类别");
+      return;
+    }
+    if (computeEngine === "polars" && !computeSavePath.trim()) {
+      toast.error("请填写 Parquet 保存路径");
+      return;
+    }
+    if (computeEngine === "hive" && (!computeHiveDb.trim() || !computeHiveTable.trim())) {
+      toast.error("请填写目标 Hive 数据库和表名");
+      return;
+    }
+    setComputeRunning(true);
+    setComputeJobResult(null);
+    try {
+      const result = await computeApi.run({
+        engine: computeEngine,
+        feature_ids: computeFeatureIds.length > 0 ? computeFeatureIds : undefined,
+        category: computeCategory !== "全部" ? computeCategory : undefined,
+        save_path: computeEngine === "polars" ? computeSavePath.trim() : undefined,
+        hive_database: computeEngine === "hive" ? computeHiveDb.trim() : undefined,
+        hive_table: computeEngine === "hive" ? computeHiveTable.trim() : undefined,
+      });
+      setComputeJobResult(result);
+      toast.success(`计算完成，${result.feature_count} 个特征，耗时 ${result.duration_ms}ms`);
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : "计算失败");
+    } finally {
+      setComputeRunning(false);
+    }
+  };
+
+  const handleComputeImport = async () => {
+    if (!computeJobResult) return;
+    setComputeImporting(true);
+    try {
+      const res = await computeApi.importDatasource(computeJobResult.job_id);
+      toast.success(`衍生数据源已入库，ID: ${res.datasource?.id}，特征元数据已关联`);
+      await loadDatasources();
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : "入库失败");
+    } finally {
+      setComputeImporting(false);
+    }
+  };
+
   const handleSaveFeature = async (data: Partial<Feature>) => {
     try {
       const payload = {
@@ -387,12 +616,13 @@ export function FeatureDevelopment() {
     try {
       const result = await featureDevApi.validateSave({
         name: workbenchFeatureName,
-        category: "行为特征",
+        category: workbenchCategory,
         scene: workbenchScene,
         source: workbenchSource,
         desc: "工作台验证并保存",
         creator: "当前用户",
         definition: workbenchDefinition,
+        datasource_id: workbenchDatasourceId || undefined,
       });
       setPreviewRows(result.preview.rows);
       setPreviewStats(result.preview.stats);
@@ -400,7 +630,7 @@ export function FeatureDevelopment() {
       setWorkbenchScene(result.feature.scene);
       setWorkbenchSource(result.feature.source);
       setWorkbenchDefinition(result.feature.definition || workbenchDefinition);
-      toast.success("特征定义验证通过，已保存到特征资产库");
+      toast.success(`特征定义验证通过，已保存到特征资产库，ID: ${result.feature.id}`);
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : "验证保存失败");
     }
@@ -547,15 +777,28 @@ export function FeatureDevelopment() {
                   <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-slate-50 text-slate-500" readOnly value={workbenchFeatureId} />
                 </div>
                 <div>
-                  <label className="text-xs text-slate-500 font-medium block mb-1.5">数据来源</label>
-                  <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={workbenchSource} onChange={e => setWorkbenchSource(e.target.value)}>
-                    <option>用户行为埋点</option><option>业务核心库</option><option>征信数据（人行）</option>
+                  <label className="text-xs text-slate-500 font-medium block mb-1.5">特征类别</label>
+                  <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={workbenchCategory} onChange={e => setWorkbenchCategory(e.target.value)}>
+                    {["行为特征", "信用历史", "设备特征", "多头行为"].map(c => <option key={c}>{c}</option>)}
                   </select>
                 </div>
                 <div>
                   <label className="text-xs text-slate-500 font-medium block mb-1.5">业务场景</label>
                   <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={workbenchScene} onChange={e => setWorkbenchScene(e.target.value)}>
                     <option>贷前审批</option><option>贷中监控</option><option>贷后催收</option><option>反欺诈</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-500 font-medium block mb-1.5">数据来源</label>
+                  <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={workbenchSource} onChange={e => setWorkbenchSource(e.target.value)}>
+                    <option>用户行为埋点</option><option>业务核心库</option><option>征信数据（人行）</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-500 font-medium block mb-1.5">关联数据源（可选）</label>
+                  <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white" value={workbenchDatasourceId} onChange={e => setWorkbenchDatasourceId(e.target.value)}>
+                    <option value="">-- 不关联 --</option>
+                    {datasources.map(ds => <option key={ds.id} value={ds.id}>{ds.name} ({ds.type})</option>)}
                   </select>
                 </div>
               </div>
@@ -635,6 +878,124 @@ export function FeatureDevelopment() {
 
       {activeTab === 2 && (
         <div className="space-y-4">
+          {/* Batch compute panel */}
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <button
+              className="w-full px-5 py-4 flex items-center justify-between hover:bg-slate-50 transition-colors"
+              onClick={() => setComputePanelOpen(o => !o)}
+            >
+              <div className="flex items-center gap-2">
+                <Zap size={15} className="text-blue-600" />
+                <span className="text-slate-800 font-semibold text-sm">离线批量计算</span>
+                <span className="text-xs px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded">Polars / Hive</span>
+              </div>
+              <span className="text-slate-400 text-xs">{computePanelOpen ? "收起 ▲" : "展开 ▼"}</span>
+            </button>
+            {computePanelOpen && (
+              <div className="px-5 pb-5 space-y-4 border-t border-slate-100">
+                {/* Feature selection */}
+                <div className="pt-4 grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-xs text-slate-500 font-medium block mb-1.5">特征类别筛选</label>
+                    <select className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white"
+                      value={computeCategory} onChange={e => { setComputeCategory(e.target.value); setComputeFeatureIds([]); }}>
+                      {["全部", "行为特征", "信用历史", "设备特征", "多头行为"].map(c => <option key={c}>{c}</option>)}
+                    </select>
+                  </div>
+                  <div className="flex items-end">
+                    <button onClick={handleSelectAllComputeFeatures} className="px-3 py-2 text-xs border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">
+                      {filteredComputeFeatures.length > 0 && filteredComputeFeatures.every(f => computeFeatureIds.includes(f.id)) ? "全部取消" : "全选"}
+                    </button>
+                  </div>
+                </div>
+                {filteredComputeFeatures.length > 0 && (
+                  <div className="border border-slate-200 rounded-lg p-3 max-h-40 overflow-y-auto grid grid-cols-3 gap-1.5">
+                    {filteredComputeFeatures.map(f => (
+                      <label key={f.id} className="flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer hover:text-blue-700">
+                        <input type="checkbox" checked={computeFeatureIds.includes(f.id)} onChange={() => toggleComputeFeature(f.id)} className="rounded" />
+                        <span className="truncate" title={f.name}>{f.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+                <div className="text-[11px] text-slate-400">
+                  已选 {computeFeatureIds.length} 个特征
+                  {computeCategory !== "全部" && computeFeatureIds.length === 0 && "（未选择时将计算该类别全部特征）"}
+                </div>
+
+                {/* Engine selection */}
+                <div>
+                  <label className="text-xs text-slate-500 font-medium block mb-2">计算引擎</label>
+                  <div className="flex gap-4">
+                    {(["polars", "hive"] as const).map(e => (
+                      <label key={e} className="flex items-center gap-2 text-sm text-slate-700 cursor-pointer">
+                        <input type="radio" name="engine" value={e} checked={computeEngine === e} onChange={() => setComputeEngine(e)} />
+                        <span className="font-mono">{e === "polars" ? "Polars (本地/HDFS)" : "Hive CLI"}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Destination config */}
+                {computeEngine === "polars" ? (
+                  <div>
+                    <label className="text-xs text-slate-500 font-medium block mb-1.5">Parquet 保存路径 <span className="text-red-500">*</span></label>
+                    <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400 font-mono"
+                      placeholder="/data/features/output.parquet"
+                      value={computeSavePath} onChange={e => setComputeSavePath(e.target.value)} />
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs text-slate-500 font-medium block mb-1.5">目标 Hive 数据库 <span className="text-red-500">*</span></label>
+                      <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400 font-mono"
+                        placeholder="feature_db"
+                        value={computeHiveDb} onChange={e => setComputeHiveDb(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-500 font-medium block mb-1.5">目标 Hive 表 <span className="text-red-500">*</span></label>
+                      <input className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-blue-400 font-mono"
+                        placeholder="derived_features"
+                        value={computeHiveTable} onChange={e => setComputeHiveTable(e.target.value)} />
+                    </div>
+                  </div>
+                )}
+
+                {/* Run button */}
+                <div className="flex items-center gap-3 pt-1">
+                  <button onClick={() => void handleComputeRun()} disabled={computeRunning} className="flex items-center gap-2 px-5 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50">
+                    <Play size={14} />
+                    {computeRunning ? "计算中..." : "开始计算"}
+                  </button>
+                  {computeJobResult && computeJobResult.status === "success" && (
+                    <button onClick={() => void handleComputeImport()} disabled={computeImporting} className="flex items-center gap-2 px-5 py-2 bg-emerald-600 text-white rounded-lg text-sm font-medium hover:bg-emerald-700 disabled:opacity-50">
+                      <Download size={14} />
+                      {computeImporting ? "入库中..." : "将衍生结果入库"}
+                    </button>
+                  )}
+                </div>
+
+                {/* Job result */}
+                {computeJobResult && (
+                  <div className={`rounded-lg p-3 text-sm border ${computeJobResult.status === "success" ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`}>
+                    <div className="flex items-center gap-2 font-medium">
+                      {computeJobResult.status === "success" ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
+                      {computeJobResult.status === "success" ? "计算成功" : "计算失败"}
+                    </div>
+                    {computeJobResult.status === "success" && (
+                      <div className="mt-1 text-xs space-x-4">
+                        <span>特征数量: {computeJobResult.feature_count}</span>
+                        <span>耗时: {computeJobResult.duration_ms}ms</span>
+                        <span>任务ID: {computeJobResult.job_id}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Stats */}
           <div className="grid grid-cols-4 gap-3">
             {[
               { label: "运行中任务", value: String(runningTasks), color: "emerald" },

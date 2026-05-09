@@ -29,6 +29,7 @@ export type Feature = {
   updateTime: string;
   desc: string;
   definition?: string;
+  datasource_id?: string;
 };
 
 export type DataSource = {
@@ -43,6 +44,11 @@ export type DataSource = {
   host?: string;
   port?: number;
   database?: string;
+  file_path?: string;
+  pk_column?: string;
+  date_column?: string;
+  feature_columns?: string;
+  table_name?: string;
 };
 
 export type Task = {
@@ -225,6 +231,27 @@ export type AnalysisJob = {
   error_msg: string;
 };
 
+export type ComputeJob = {
+  id: string;
+  engine: string;
+  feature_ids: string;
+  category: string;
+  save_path: string;
+  hive_database: string;
+  hive_table: string;
+  status: string;
+  started_at: string;
+  ended_at: string;
+  result_datasource_id: string;
+  error_msg: string;
+  log: string;
+};
+
+export type FilePreviewResult = {
+  columns: string[];
+  rows: Record<string, unknown>[];
+};
+
 export type MonitoringOverview = {
   apiMetrics: Array<{
     name: string;
@@ -256,7 +283,13 @@ export type DashboardOverview = {
 // ─── Features API ──────────────────────────────────────────────────────────
 export const featuresApi = {
   list: (params?: { scene?: string; status?: string; category?: string; search?: string }) => {
-    const q = new URLSearchParams(params as Record<string, string>).toString();
+    const clean: Record<string, string> = {};
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== null && v !== "") clean[k] = v;
+      }
+    }
+    const q = new URLSearchParams(clean).toString();
     return request<Feature[]>(`/api/features${q ? "?" + q : ""}`);
   },
   get: (id: string) => request<Feature>(`/api/features/${id}`),
@@ -284,6 +317,15 @@ export const datasourcesApi = {
     request<DataSource>(`/api/datasources/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   delete: (id: string) =>
     request<{ success: boolean }>(`/api/datasources/${id}`, { method: "DELETE" }),
+  previewFile: (file_path: string, file_type: "csv" | "xlsx") =>
+    request<FilePreviewResult>("/api/datasources/preview-file", {
+      method: "POST",
+      body: JSON.stringify({ file_path, file_type }),
+    }),
+  getColumns: (id: string) =>
+    request<{ pk_column: string; date_column: string; feature_columns: string[] }>(
+      `/api/datasources/${id}/columns`
+    ),
 };
 
 // ─── Tasks API ─────────────────────────────────────────────────────────────
@@ -362,6 +404,7 @@ export const featureDevApi = {
     desc?: string;
     creator?: string;
     definition: string;
+    datasource_id?: string;
   }) =>
     request<{ success: boolean; feature: Feature; preview: { rows: Array<{ userId: string; label: number; value: number }>; stats: { sampleCount: number; coverage: number; iv: number; ks: number; psi: number; auc: number } } }>("/api/feature-development/validate-save", {
       method: "POST",
@@ -413,4 +456,26 @@ export const monitoringApi = {
 
 export const dashboardApi = {
   overview: () => request<DashboardOverview>("/api/dashboard/overview"),
+};
+
+// ─── Compute API ──────────────────────────────────────────────────────────
+export const computeApi = {
+  run: (data: {
+    engine: "polars" | "hive";
+    feature_ids?: string[];
+    category?: string;
+    save_path?: string;
+    hive_database?: string;
+    hive_table?: string;
+  }) =>
+    request<{ job_id: string; status: string; feature_count: number; duration_ms: number }>(
+      "/api/compute/run",
+      { method: "POST", body: JSON.stringify(data) }
+    ),
+  getJob: (job_id: string) => request<ComputeJob>(`/api/compute/jobs/${job_id}`),
+  importDatasource: (job_id: string) =>
+    request<{ success: boolean; datasource: DataSource }>(
+      `/api/compute/jobs/${job_id}/import-datasource`,
+      { method: "POST" }
+    ),
 };
