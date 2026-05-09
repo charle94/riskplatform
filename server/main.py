@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import sqlite3
 import json
@@ -27,6 +28,47 @@ from fastapi.responses import JSONResponse
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "risk_control.db"
+
+# Configurable data root for file I/O. When set, all user-provided file paths
+# must reside under this directory. Defaults to BASE_DIR/data.
+_PLATFORM_DATA_ROOT: str = os.environ.get(
+    "PLATFORM_DATA_ROOT", str(BASE_DIR / "data")
+).strip()
+
+
+def _validate_data_path(user_path: str, must_exist: bool = False) -> Path:
+    """Return a validated, normalized path that is guaranteed to be under
+    _PLATFORM_DATA_ROOT.
+
+    Uses only string operations for path normalization so that the check
+    happens before any filesystem access, preventing path traversal attacks.
+
+    Raises ValueError with a descriptive message on invalid input.
+    """
+    if not user_path or not user_path.strip():
+        raise ValueError("Path is required and must not be empty")
+
+    root_str = os.path.abspath(_PLATFORM_DATA_ROOT)
+    # Normalize: resolve any embedded ".." or "." without hitting the FS
+    if os.path.isabs(user_path):
+        normalized = os.path.normpath(user_path)
+    else:
+        normalized = os.path.normpath(os.path.join(root_str, user_path))
+
+    # Enforce containment: path must start with root_str + separator
+    if normalized != root_str and not normalized.startswith(root_str + os.sep):
+        raise ValueError(
+            f"Path '{normalized}' must be under the configured data root '{root_str}'. "
+            "Set the PLATFORM_DATA_ROOT environment variable to override the default."
+        )
+
+    result = Path(normalized)
+    if must_exist:
+        if not result.exists():
+            raise ValueError(f"File not found: {result}")
+        if not result.is_file():
+            raise ValueError(f"Path is not a regular file: {result}")
+    return result
 SAFE_EVAL_FUNCTIONS = {
     "abs": abs,
     "min": min,
@@ -2422,22 +2464,15 @@ def preview_datasource_file(payload: Dict[str, Any]):
         raise HTTPException(status_code=422, detail="file_type must be 'csv' or 'xlsx'")
     if not _POLARS_AVAILABLE:
         raise HTTPException(status_code=500, detail="polars is not installed on the server")
-    # Resolve and validate path (must be absolute, no traversal)
     try:
-        resolved = Path(file_path).resolve()
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid file path")
-    if not resolved.is_absolute():
-        raise HTTPException(status_code=422, detail="file_path must be an absolute path")
-    if not resolved.exists():
-        raise HTTPException(status_code=422, detail=f"File not found: {resolved}")
-    if not resolved.is_file():
-        raise HTTPException(status_code=422, detail="Path is not a regular file")
+        safe_path = _validate_data_path(file_path, must_exist=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         if file_type == "csv":
-            df = pl.read_csv(str(resolved), n_rows=5, infer_schema_length=100)
+            df = pl.read_csv(str(safe_path), n_rows=5, infer_schema_length=100)
         else:
-            df = pl.read_excel(str(resolved), read_options={"n_rows": 5})
+            df = pl.read_excel(str(safe_path), read_options={"n_rows": 5})
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Failed to read file: {exc}") from exc
     columns = df.columns
@@ -2475,13 +2510,11 @@ def _compute_polars_engine(
         raise RuntimeError("polars is not available on this server")
     if not save_path:
         raise ValueError("save_path is required for polars engine")
-    # Validate save path (must be absolute)
+    # Validate save path against the data root (string-only validation, no FS access yet)
     try:
-        resolved = Path(save_path).resolve()
-    except Exception as exc:
+        safe_path = _validate_data_path(save_path, must_exist=False)
+    except ValueError as exc:
         raise ValueError(f"Invalid save_path: {exc}") from exc
-    if not resolved.is_absolute():
-        raise ValueError("save_path must be an absolute path")
 
     users = conn.execute("SELECT * FROM sample_users").fetchall()
     allowed_fields = _sample_user_fields(conn)
@@ -2499,9 +2532,9 @@ def _compute_polars_engine(
             data[fr["id"]].append(val)
 
     df = pl.DataFrame(data)
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(str(resolved))
-    return f"Wrote {len(users)} rows x {len(feature_rows)} features to {resolved}"
+    safe_path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(str(safe_path))
+    return f"Wrote {len(users)} rows x {len(feature_rows)} features to {safe_path}"
 
 
 def _compute_hive_engine(
