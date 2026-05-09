@@ -40,8 +40,8 @@ def _validate_data_path(user_path: str, must_exist: bool = False) -> Path:
     """Return a validated, normalized path that is guaranteed to be under
     _PLATFORM_DATA_ROOT.
 
-    Uses only string operations for path normalization so that the check
-    happens before any filesystem access, preventing path traversal attacks.
+    Uses only string operations for path normalization so that the containment
+    check happens before any filesystem access, preventing path traversal.
 
     Raises ValueError with a descriptive message on invalid input.
     """
@@ -49,26 +49,49 @@ def _validate_data_path(user_path: str, must_exist: bool = False) -> Path:
         raise ValueError("Path is required and must not be empty")
 
     root_str = os.path.abspath(_PLATFORM_DATA_ROOT)
-    # Normalize: resolve any embedded ".." or "." without hitting the FS
+    # Normalize: resolve embedded ".." or "." using only string operations
     if os.path.isabs(user_path):
         normalized = os.path.normpath(user_path)
     else:
         normalized = os.path.normpath(os.path.join(root_str, user_path))
 
-    # Enforce containment: path must start with root_str + separator
+    # Enforce containment: path must be root itself or start with root + separator
     if normalized != root_str and not normalized.startswith(root_str + os.sep):
         raise ValueError(
             f"Path '{normalized}' must be under the configured data root '{root_str}'. "
             "Set the PLATFORM_DATA_ROOT environment variable to override the default."
         )
 
-    result = Path(normalized)
+    # Reconstruct path from the trusted root + the validated relative component
+    # so downstream code operates on a path derived from the trusted root.
+    root_path = Path(root_str)
+    result = root_path / Path(normalized).relative_to(root_path) if normalized != root_str else root_path
     if must_exist:
         if not result.exists():
             raise ValueError(f"File not found: {result}")
         if not result.is_file():
             raise ValueError(f"Path is not a regular file: {result}")
     return result
+
+
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_sql_identifier(name: str, label: str) -> str:
+    """Validate a SQL / Hive identifier (database or table name).
+
+    Only allows alphanumeric characters and underscores to prevent SQL injection.
+    """
+    if not name or not name.strip():
+        raise ValueError(f"{label} is required")
+    if not _SAFE_IDENTIFIER_RE.match(name.strip()):
+        raise ValueError(
+            f"{label} '{name}' contains invalid characters. "
+            "Only letters, digits, and underscores are allowed."
+        )
+    return name.strip()
+
+
 SAFE_EVAL_FUNCTIONS = {
     "abs": abs,
     "min": min,
@@ -2543,13 +2566,17 @@ def _compute_hive_engine(
     hive_table: str,
 ) -> str:
     """Generate and run HiveQL for feature computation. Returns log string."""
-    if not hive_database or not hive_table:
-        raise ValueError("hive_database and hive_table are required for hive engine")
+    # Validate identifiers to prevent SQL injection
+    try:
+        safe_db = _validate_sql_identifier(hive_database, "hive_database")
+        safe_table = _validate_sql_identifier(hive_table, "hive_table")
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
 
     today = now_date()
     col_defs = ",\n    ".join(f"`{fr['id']}` DOUBLE COMMENT '{fr['name']}'" for fr in feature_rows)
     create_sql = (
-        f"CREATE TABLE IF NOT EXISTS `{hive_database}`.`{hive_table}` (\n"
+        f"CREATE TABLE IF NOT EXISTS `{safe_db}`.`{safe_table}` (\n"
         f"    `user_id` STRING,\n    {col_defs}\n"
         f") PARTITIONED BY (dt STRING) STORED AS PARQUET"
     )
@@ -2557,7 +2584,7 @@ def _compute_hive_engine(
         f"({fr['definition'] or 'NULL'}) AS `{fr['id']}`" for fr in feature_rows
     )
     insert_sql = (
-        f"INSERT OVERWRITE TABLE `{hive_database}`.`{hive_table}` PARTITION(dt='{today}')\n"
+        f"INSERT OVERWRITE TABLE `{safe_db}`.`{safe_table}` PARTITION(dt='{today}')\n"
         f"SELECT user_id, {feature_exprs}\nFROM sample_users"
     )
     full_sql = f"{create_sql};\n{insert_sql};"
@@ -2566,8 +2593,10 @@ def _compute_hive_engine(
         capture_output=True, text=True, timeout=300,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"Hive CLI failed: {result.stderr[:1000]}")
-    return result.stdout[:2000]
+        stderr_preview = result.stderr[:1000] + ("..." if len(result.stderr) > 1000 else "")
+        raise RuntimeError(f"Hive CLI failed: {stderr_preview}")
+    stdout = result.stdout
+    return stdout[:2000] + ("..." if len(stdout) > 2000 else "")
 
 
 @app.post("/api/compute/run")
@@ -2582,6 +2611,14 @@ def compute_run(payload: Dict[str, Any]):
     save_path = str(payload.get("save_path") or "").strip()
     hive_database = str(payload.get("hive_database") or "").strip()
     hive_table = str(payload.get("hive_table") or "").strip()
+
+    # Validate engine-specific parameters early
+    if engine == "hive":
+        try:
+            hive_database = _validate_sql_identifier(hive_database, "hive_database")
+            hive_table = _validate_sql_identifier(hive_table, "hive_table")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     conn = get_conn()
     if feature_ids_input:
