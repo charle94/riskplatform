@@ -31,7 +31,10 @@ function DataSourceDialog({
     if (open) {
       if (initial) {
         let fc: string[] = [];
-        try { fc = JSON.parse(initial.feature_columns || "[]"); } catch { fc = []; }
+        try { fc = JSON.parse(initial.feature_columns || "[]"); } catch {
+          console.warn("Failed to parse feature_columns, defaulting to []");
+          fc = [];
+        }
         setForm({
           name: initial.name, type: initial.type, host: initial.host || "",
           port: String(initial.port || ""), database: initial.database || "",
@@ -533,8 +536,7 @@ export function FeatureDevelopment() {
 
   const handleComputeRun = async () => {
     if (computeFeatureIds.length === 0 && computeCategory === "全部") {
-      toast.error("请至少选择一个特征，或指定特征类别");
-      return;
+      if (!confirm("未选择特征或类别，将计算所有特征。确认继续？")) return;
     }
     if (computeEngine === "polars" && !computeSavePath.trim()) {
       toast.error("请填写 Parquet 保存路径");

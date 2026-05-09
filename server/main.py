@@ -373,8 +373,9 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     for sql in migrations:
         try:
             conn.execute(sql)
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
     conn.commit()
 
 
@@ -2421,14 +2422,22 @@ def preview_datasource_file(payload: Dict[str, Any]):
         raise HTTPException(status_code=422, detail="file_type must be 'csv' or 'xlsx'")
     if not _POLARS_AVAILABLE:
         raise HTTPException(status_code=500, detail="polars is not installed on the server")
-    path = Path(file_path)
-    if not path.exists():
-        raise HTTPException(status_code=422, detail=f"File not found: {file_path}")
+    # Resolve and validate path (must be absolute, no traversal)
+    try:
+        resolved = Path(file_path).resolve()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid file path")
+    if not resolved.is_absolute():
+        raise HTTPException(status_code=422, detail="file_path must be an absolute path")
+    if not resolved.exists():
+        raise HTTPException(status_code=422, detail=f"File not found: {resolved}")
+    if not resolved.is_file():
+        raise HTTPException(status_code=422, detail="Path is not a regular file")
     try:
         if file_type == "csv":
-            df = pl.read_csv(str(path), n_rows=5, infer_schema_length=100)
+            df = pl.read_csv(str(resolved), n_rows=5, infer_schema_length=100)
         else:
-            df = pl.read_excel(str(path), read_options={"n_rows": 5})
+            df = pl.read_excel(str(resolved), read_options={"n_rows": 5})
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Failed to read file: {exc}") from exc
     columns = df.columns
@@ -2466,6 +2475,13 @@ def _compute_polars_engine(
         raise RuntimeError("polars is not available on this server")
     if not save_path:
         raise ValueError("save_path is required for polars engine")
+    # Validate save path (must be absolute)
+    try:
+        resolved = Path(save_path).resolve()
+    except Exception as exc:
+        raise ValueError(f"Invalid save_path: {exc}") from exc
+    if not resolved.is_absolute():
+        raise ValueError("save_path must be an absolute path")
 
     users = conn.execute("SELECT * FROM sample_users").fetchall()
     allowed_fields = _sample_user_fields(conn)
@@ -2483,10 +2499,9 @@ def _compute_polars_engine(
             data[fr["id"]].append(val)
 
     df = pl.DataFrame(data)
-    out_path = Path(save_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(str(out_path))
-    return f"Wrote {len(users)} rows x {len(feature_rows)} features to {save_path}"
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(str(resolved))
+    return f"Wrote {len(users)} rows x {len(feature_rows)} features to {resolved}"
 
 
 def _compute_hive_engine(
@@ -2529,7 +2544,7 @@ def compute_run(payload: Dict[str, Any]):
     if engine not in ("polars", "hive"):
         raise HTTPException(status_code=422, detail="engine must be 'polars' or 'hive'")
 
-    feature_ids_input = [str(x) for x in (payload.get("feature_ids") or []) if str(x).strip()]
+    feature_ids_input = [str(x) for x in (payload.get("feature_ids") or []) if x is not None and str(x).strip()]
     category = str(payload.get("category") or "").strip()
     save_path = str(payload.get("save_path") or "").strip()
     hive_database = str(payload.get("hive_database") or "").strip()
@@ -2599,7 +2614,7 @@ def compute_run(payload: Dict[str, Any]):
     except Exception as exc:
         conn.execute(
             "UPDATE compute_jobs SET status='failed', error_msg=? WHERE id=?",
-            (str(exc)[:2000], job_id),
+            (str(exc)[:1997] + "..." if len(str(exc)) > 2000 else str(exc), job_id),
         )
         conn.commit()
         conn.close()
