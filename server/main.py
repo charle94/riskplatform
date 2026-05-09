@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import sqlite3
 import json
 import re
+import subprocess
 from collections import defaultdict
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import polars as pl
+    _POLARS_AVAILABLE = True
+except ImportError:
+    _POLARS_AVAILABLE = False
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
@@ -20,6 +28,70 @@ from fastapi.responses import JSONResponse
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "risk_control.db"
+
+# Configurable data root for file I/O. When set, all user-provided file paths
+# must reside under this directory. Defaults to BASE_DIR/data.
+_PLATFORM_DATA_ROOT: str = os.environ.get(
+    "PLATFORM_DATA_ROOT", str(BASE_DIR / "data")
+).strip()
+
+
+def _validate_data_path(user_path: str, must_exist: bool = False) -> Path:
+    """Return a validated, normalized path that is guaranteed to be under
+    _PLATFORM_DATA_ROOT.
+
+    Uses only string operations for path normalization so that the containment
+    check happens before any filesystem access, preventing path traversal.
+
+    Raises ValueError with a descriptive message on invalid input.
+    """
+    if not user_path or not user_path.strip():
+        raise ValueError("Path is required and must not be empty")
+
+    root_str = os.path.abspath(_PLATFORM_DATA_ROOT)
+    # Normalize: resolve embedded ".." or "." using only string operations
+    if os.path.isabs(user_path):
+        normalized = os.path.normpath(user_path)
+    else:
+        normalized = os.path.normpath(os.path.join(root_str, user_path))
+
+    # Enforce containment: path must be root itself or start with root + separator
+    if normalized != root_str and not normalized.startswith(root_str + os.sep):
+        raise ValueError(
+            f"Path '{normalized}' must be under the configured data root '{root_str}'. "
+            "Set the PLATFORM_DATA_ROOT environment variable to override the default."
+        )
+
+    # Reconstruct path from the trusted root + the validated relative component
+    # so downstream code operates on a path derived from the trusted root.
+    root_path = Path(root_str)
+    result = root_path / Path(normalized).relative_to(root_path) if normalized != root_str else root_path
+    if must_exist:
+        if not result.exists():
+            raise ValueError(f"File not found: {result}")
+        if not result.is_file():
+            raise ValueError(f"Path is not a regular file: {result}")
+    return result
+
+
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_sql_identifier(name: str, label: str) -> str:
+    """Validate a SQL / Hive identifier (database or table name).
+
+    Only allows alphanumeric characters and underscores to prevent SQL injection.
+    """
+    if not name or not name.strip():
+        raise ValueError(f"{label} is required")
+    if not _SAFE_IDENTIFIER_RE.match(name.strip()):
+        raise ValueError(
+            f"{label} '{name}' contains invalid characters. "
+            "Only letters, digits, and underscores are allowed."
+        )
+    return name.strip()
+
+
 SAFE_EVAL_FUNCTIONS = {
     "abs": abs,
     "min": min,
@@ -303,6 +375,22 @@ def init_db() -> None:
             error_msg TEXT NOT NULL DEFAULT ''
         );
 
+        CREATE TABLE IF NOT EXISTS compute_jobs (
+            id TEXT PRIMARY KEY,
+            engine TEXT NOT NULL,
+            feature_ids TEXT NOT NULL DEFAULT '[]',
+            category TEXT NOT NULL DEFAULT '',
+            save_path TEXT NOT NULL DEFAULT '',
+            hive_database TEXT NOT NULL DEFAULT '',
+            hive_table TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL DEFAULT '',
+            ended_at TEXT NOT NULL DEFAULT '',
+            result_datasource_id TEXT NOT NULL DEFAULT '',
+            error_msg TEXT NOT NULL DEFAULT '',
+            log TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE TABLE IF NOT EXISTS feature_stats_cache (
             feature_id TEXT PRIMARY KEY,
             feature_name TEXT NOT NULL DEFAULT '',
@@ -332,8 +420,28 @@ def init_db() -> None:
     seeded = cur.execute("SELECT COUNT(1) AS c FROM features").fetchone()["c"]
     if seeded == 0:
         seed_data(cur)
+    _migrate_db(conn)
     conn.commit()
     conn.close()
+
+
+def _migrate_db(conn: sqlite3.Connection) -> None:
+    """Apply schema migrations for new columns (idempotent – ignores already-existing columns)."""
+    migrations = [
+        "ALTER TABLE datasources ADD COLUMN file_path TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE datasources ADD COLUMN pk_column TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE datasources ADD COLUMN date_column TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE datasources ADD COLUMN feature_columns TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE datasources ADD COLUMN table_name TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE features ADD COLUMN datasource_id TEXT NOT NULL DEFAULT ''",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+    conn.commit()
 
 
 def seed_data(cur: sqlite3.Cursor) -> None:
@@ -556,6 +664,7 @@ def row_to_feature(row: sqlite3.Row) -> Dict[str, Any]:
         "updateTime": row["updateTime"],
         "desc": row["desc"],
         "definition": row["definition"],
+        "datasource_id": row["datasource_id"] if "datasource_id" in row.keys() else "",
     }
 
 
@@ -2165,13 +2274,14 @@ def create_feature(payload: Dict[str, Any]):
         today,
         str(payload.get("desc") or ""),
         _normalize_expression(definition),
+        str(payload.get("datasource_id") or ""),
     )
     conn.execute(
         """
         INSERT INTO features (
             id, name, category, scene, source, status, version, iv, psi, usedBy,
-            creator, createTime, updateTime, desc, definition
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            creator, createTime, updateTime, desc, definition, datasource_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         row,
     )
@@ -2193,7 +2303,7 @@ def update_feature(feature_id: str, payload: Dict[str, Any]):
         raise HTTPException(status_code=404, detail="Feature not found")
 
     current = dict(row)
-    fields = ["name", "category", "scene", "source", "status", "version", "iv", "psi", "creator", "desc", "definition"]
+    fields = ["name", "category", "scene", "source", "status", "version", "iv", "psi", "creator", "desc", "definition", "datasource_id"]
     for f in fields:
         if f in payload:
             current[f] = payload[f]
@@ -2215,7 +2325,7 @@ def update_feature(feature_id: str, payload: Dict[str, Any]):
         """
         UPDATE features
         SET name=?, category=?, scene=?, source=?, status=?, version=?, iv=?, psi=?,
-            usedBy=?, creator=?, updateTime=?, desc=?, definition=?
+            usedBy=?, creator=?, updateTime=?, desc=?, definition=?, datasource_id=?
         WHERE id=?
         """,
         (
@@ -2227,11 +2337,12 @@ def update_feature(feature_id: str, payload: Dict[str, Any]):
             current["version"],
             float(current["iv"]),
             float(current["psi"]),
-            str(current["usedBy"]),
+            str(current.get("usedBy", "")),
             current["creator"],
             current["updateTime"],
             current["desc"],
             current["definition"],
+            str(current.get("datasource_id", "")),
             feature_id,
         ),
     )
@@ -2278,8 +2389,9 @@ def create_datasource(payload: Dict[str, Any]):
     conn.execute(
         """
         INSERT INTO datasources
-        (id, name, type, tables, status, latency, lastSync, coverage, host, port, database)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, name, type, tables, status, latency, lastSync, coverage, host, port, database,
+         file_path, pk_column, date_column, feature_columns, table_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             ds_id,
@@ -2293,6 +2405,11 @@ def create_datasource(payload: Dict[str, Any]):
             str(payload.get("host") or ""),
             int(payload.get("port") or 0),
             str(payload.get("database") or ""),
+            str(payload.get("file_path") or ""),
+            str(payload.get("pk_column") or ""),
+            str(payload.get("date_column") or ""),
+            json.dumps(payload.get("feature_columns") or [], ensure_ascii=False),
+            str(payload.get("table_name") or ""),
         ),
     )
     conn.commit()
@@ -2309,13 +2426,18 @@ def update_datasource(ds_id: str, payload: Dict[str, Any]):
         conn.close()
         raise HTTPException(status_code=404, detail="DataSource not found")
     cur = dict(row)
-    for k in ["name", "type", "tables", "status", "latency", "lastSync", "coverage", "host", "port", "database"]:
+    for k in ["name", "type", "tables", "status", "latency", "lastSync", "coverage", "host", "port", "database",
+               "file_path", "pk_column", "date_column", "table_name"]:
         if k in payload:
             cur[k] = payload[k]
+    if "feature_columns" in payload:
+        fc = payload["feature_columns"]
+        cur["feature_columns"] = json.dumps(fc if isinstance(fc, list) else [], ensure_ascii=False)
     conn.execute(
         """
         UPDATE datasources SET
-            name=?, type=?, tables=?, status=?, latency=?, lastSync=?, coverage=?, host=?, port=?, database=?
+            name=?, type=?, tables=?, status=?, latency=?, lastSync=?, coverage=?, host=?, port=?, database=?,
+            file_path=?, pk_column=?, date_column=?, feature_columns=?, table_name=?
         WHERE id=?
         """,
         (
@@ -2326,9 +2448,14 @@ def update_datasource(ds_id: str, payload: Dict[str, Any]):
             cur["latency"],
             cur["lastSync"],
             int(cur["coverage"]),
-            cur["host"],
-            int(cur["port"] or 0),
-            cur["database"],
+            cur.get("host", ""),
+            int(cur.get("port") or 0),
+            cur.get("database", ""),
+            cur.get("file_path", ""),
+            cur.get("pk_column", ""),
+            cur.get("date_column", ""),
+            cur.get("feature_columns", "[]"),
+            cur.get("table_name", ""),
             ds_id,
         ),
     )
@@ -2347,6 +2474,322 @@ def delete_datasource(ds_id: str):
     if n == 0:
         raise HTTPException(status_code=404, detail="DataSource not found")
     return {"success": True}
+
+
+@app.post("/api/datasources/preview-file")
+def preview_datasource_file(payload: Dict[str, Any]):
+    """Preview first rows of a CSV or XLSX file using polars."""
+    file_path = str(payload.get("file_path") or "").strip()
+    file_type = str(payload.get("file_type") or "").strip().lower()
+    if not file_path:
+        raise HTTPException(status_code=422, detail="file_path is required")
+    if file_type not in ("csv", "xlsx"):
+        raise HTTPException(status_code=422, detail="file_type must be 'csv' or 'xlsx'")
+    if not _POLARS_AVAILABLE:
+        raise HTTPException(status_code=500, detail="polars is not installed on the server")
+    try:
+        safe_path = _validate_data_path(file_path, must_exist=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        if file_type == "csv":
+            df = pl.read_csv(str(safe_path), n_rows=5, infer_schema_length=100)
+        else:
+            df = pl.read_excel(str(safe_path), read_options={"n_rows": 5})
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Failed to read file: {exc}") from exc
+    columns = df.columns
+    rows = df.to_dicts()
+    return {"columns": columns, "rows": rows}
+
+
+@app.get("/api/datasources/{ds_id}/columns")
+def datasource_columns(ds_id: str):
+    """Return the column metadata of a file-based datasource."""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM datasources WHERE id = ?", (ds_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="DataSource not found")
+    feature_columns: List[str] = []
+    try:
+        feature_columns = json.loads(row["feature_columns"] or "[]")
+    except Exception:
+        feature_columns = []
+    return {
+        "pk_column": row["pk_column"] or "",
+        "date_column": row["date_column"] or "",
+        "feature_columns": feature_columns,
+    }
+
+
+def _compute_polars_engine(
+    conn: sqlite3.Connection,
+    feature_rows: List[sqlite3.Row],
+    save_path: str,
+) -> str:
+    """Compute features using polars and write a parquet file. Returns log string."""
+    if not _POLARS_AVAILABLE:
+        raise RuntimeError("polars is not available on this server")
+    if not save_path:
+        raise ValueError("save_path is required for polars engine")
+    # Validate save path against the data root (string-only validation, no FS access yet)
+    try:
+        safe_path = _validate_data_path(save_path, must_exist=False)
+    except ValueError as exc:
+        raise ValueError(f"Invalid save_path: {exc}") from exc
+
+    users = conn.execute("SELECT * FROM sample_users").fetchall()
+    allowed_fields = _sample_user_fields(conn)
+    today = now_date()
+
+    data: Dict[str, List[Any]] = {"user_id": [], "date": []}
+    for fr in feature_rows:
+        data[fr["id"]] = []
+
+    for user in users:
+        data["user_id"].append(user["user_id"])
+        data["date"].append(today)
+        for fr in feature_rows:
+            val = evaluate_feature_expression(fr["definition"], user, allowed_fields)
+            data[fr["id"]].append(val)
+
+    df = pl.DataFrame(data)
+    safe_path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(str(safe_path))
+    return f"Wrote {len(users)} rows x {len(feature_rows)} features to {safe_path}"
+
+
+def _compute_hive_engine(
+    feature_rows: List[sqlite3.Row],
+    hive_database: str,
+    hive_table: str,
+) -> str:
+    """Generate and run HiveQL for feature computation. Returns log string."""
+    # Validate identifiers to prevent SQL injection
+    try:
+        safe_db = _validate_sql_identifier(hive_database, "hive_database")
+        safe_table = _validate_sql_identifier(hive_table, "hive_table")
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+    today = now_date()
+    col_defs = ",\n    ".join(f"`{fr['id']}` DOUBLE COMMENT '{fr['name']}'" for fr in feature_rows)
+    create_sql = (
+        f"CREATE TABLE IF NOT EXISTS `{safe_db}`.`{safe_table}` (\n"
+        f"    `user_id` STRING,\n    {col_defs}\n"
+        f") PARTITIONED BY (dt STRING) STORED AS PARQUET"
+    )
+    feature_exprs = ", ".join(
+        f"({fr['definition'] or 'NULL'}) AS `{fr['id']}`" for fr in feature_rows
+    )
+    insert_sql = (
+        f"INSERT OVERWRITE TABLE `{safe_db}`.`{safe_table}` PARTITION(dt='{today}')\n"
+        f"SELECT user_id, {feature_exprs}\nFROM sample_users"
+    )
+    full_sql = f"{create_sql};\n{insert_sql};"
+    result = subprocess.run(
+        ["hive", "-e", full_sql],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode != 0:
+        stderr_preview = result.stderr[:1000] + ("..." if len(result.stderr) > 1000 else "")
+        raise RuntimeError(f"Hive CLI failed: {stderr_preview}")
+    stdout = result.stdout
+    return stdout[:2000] + ("..." if len(stdout) > 2000 else "")
+
+
+@app.post("/api/compute/run")
+def compute_run(payload: Dict[str, Any]):
+    """Launch an offline batch feature computation job (synchronous)."""
+    engine = str(payload.get("engine") or "polars").lower()
+    if engine not in ("polars", "hive"):
+        raise HTTPException(status_code=422, detail="engine must be 'polars' or 'hive'")
+
+    feature_ids_input = [str(x) for x in (payload.get("feature_ids") or []) if x is not None and str(x).strip()]
+    category = str(payload.get("category") or "").strip()
+    save_path = str(payload.get("save_path") or "").strip()
+    hive_database = str(payload.get("hive_database") or "").strip()
+    hive_table = str(payload.get("hive_table") or "").strip()
+
+    # Validate engine-specific parameters early
+    if engine == "hive":
+        try:
+            hive_database = _validate_sql_identifier(hive_database, "hive_database")
+            hive_table = _validate_sql_identifier(hive_table, "hive_table")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    conn = get_conn()
+    if feature_ids_input:
+        placeholders = ",".join("?" * len(feature_ids_input))
+        feature_rows = conn.execute(
+            f"SELECT * FROM features WHERE id IN ({placeholders})", feature_ids_input
+        ).fetchall()
+    elif category:
+        feature_rows = conn.execute(
+            "SELECT * FROM features WHERE category = ?", (category,)
+        ).fetchall()
+    else:
+        feature_rows = conn.execute("SELECT * FROM features").fetchall()
+
+    if not feature_rows:
+        conn.close()
+        raise HTTPException(status_code=400, detail="No features found to compute")
+
+    existing_ids = [r["id"] for r in conn.execute("SELECT id FROM compute_jobs").fetchall()]
+    job_id = _next_numeric_id(existing_ids, "CJ")
+    started = datetime.now()
+
+    conn.execute(
+        """
+        INSERT INTO compute_jobs
+        (id, engine, feature_ids, category, save_path, hive_database, hive_table,
+         status, started_at, ended_at, result_datasource_id, error_msg, log)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, '', '', '', '')
+        """,
+        (
+            job_id,
+            engine,
+            json.dumps([r["id"] for r in feature_rows], ensure_ascii=False),
+            category,
+            save_path,
+            hive_database,
+            hive_table,
+            started.strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
+
+    try:
+        if engine == "polars":
+            log_msg = _compute_polars_engine(conn, feature_rows, save_path)
+        else:
+            log_msg = _compute_hive_engine(feature_rows, hive_database, hive_table)
+
+        ended = datetime.now()
+        duration_ms = int((ended - started).total_seconds() * 1000)
+        conn.execute(
+            "UPDATE compute_jobs SET status='success', ended_at=?, log=? WHERE id=?",
+            (ended.strftime("%Y-%m-%d %H:%M:%S"), log_msg, job_id),
+        )
+        conn.commit()
+        conn.close()
+        return {
+            "job_id": job_id,
+            "status": "success",
+            "feature_count": len(feature_rows),
+            "duration_ms": duration_ms,
+        }
+    except Exception as exc:
+        conn.execute(
+            "UPDATE compute_jobs SET status='failed', error_msg=? WHERE id=?",
+            (str(exc)[:1997] + "..." if len(str(exc)) > 2000 else str(exc), job_id),
+        )
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/compute/jobs/{job_id}")
+def get_compute_job(job_id: str):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM compute_jobs WHERE id = ?", (job_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Compute job not found")
+    return dict(row)
+
+
+@app.post("/api/compute/jobs/{job_id}/import-datasource")
+def import_compute_result_as_datasource(job_id: str):
+    """Create a datasource record from a successful compute job and link features to it."""
+    conn = get_conn()
+    job = conn.execute("SELECT * FROM compute_jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Compute job not found")
+    if job["status"] != "success":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Job has not completed successfully")
+    if job["result_datasource_id"]:
+        # Already imported – return existing datasource
+        ds = conn.execute(
+            "SELECT * FROM datasources WHERE id = ?", (job["result_datasource_id"],)
+        ).fetchone()
+        conn.close()
+        return {"success": True, "datasource": dict(ds) if ds else None}
+
+    feature_ids: List[str] = []
+    try:
+        feature_ids = json.loads(job["feature_ids"] or "[]")
+    except Exception:
+        feature_ids = []
+
+    engine = job["engine"]
+    ds_ids = [r["id"] for r in conn.execute("SELECT id FROM datasources").fetchall()]
+    ds_id = _next_numeric_id(ds_ids, "DS")
+
+    if engine == "polars":
+        file_path = job["save_path"]
+        ds_type = "Derived-Parquet"
+        table_name = ""
+        database = ""
+    else:
+        file_path = ""
+        ds_type = "Derived-Hive"
+        table_name = job["hive_table"]
+        database = job["hive_database"]
+
+    conn.execute(
+        """
+        INSERT INTO datasources
+        (id, name, type, tables, status, latency, lastSync, coverage, host, port, database,
+         file_path, pk_column, date_column, feature_columns, table_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ds_id,
+            f"衍生特征-{job_id}",
+            ds_type,
+            1,
+            "正常",
+            "—",
+            now_date(),
+            100,
+            "",
+            0,
+            database,
+            file_path,
+            "user_id",
+            "date",
+            json.dumps(feature_ids, ensure_ascii=False),
+            table_name,
+        ),
+    )
+
+    # Link features to this new datasource
+    for fid in feature_ids:
+        conn.execute(
+            "UPDATE features SET datasource_id = ? WHERE id = ?",
+            (ds_id, fid),
+        )
+
+    conn.execute(
+        "UPDATE compute_jobs SET result_datasource_id = ? WHERE id = ?",
+        (ds_id, job_id),
+    )
+    conn.commit()
+
+    ds_row = conn.execute("SELECT * FROM datasources WHERE id = ?", (ds_id,)).fetchone()
+    log_activity(
+        conn, "compute-import",
+        f"计算作业 {job_id} 衍生数据源入库 {ds_id}",
+        "系统", "计算调度中心", f"job={job_id},ds={ds_id}",
+    )
+    conn.commit()
+    conn.close()
+    return {"success": True, "datasource": dict(ds_row)}
 
 
 @app.get("/api/tasks")
@@ -2931,6 +3374,7 @@ def validate_and_save_feature(payload: Dict[str, Any]):
         "definition": _normalize_expression(str(payload["definition"])),
         "iv": preview["stats"]["iv"],
         "psi": preview["stats"]["psi"],
+        "datasource_id": str(payload.get("datasource_id") or ""),
     }
     conn.close()
     created = create_feature(feature_payload)
